@@ -22,3 +22,4 @@ MaxChildren=4 ;最大CGI进程个数
 LocalPort=9000 ;监听端口
 RestartDelay=0
 ```
+CGI经常管理代码使用了(deemru/php-cgi-spawner)[https://github.com/deemru/php-cgi-spawner]
