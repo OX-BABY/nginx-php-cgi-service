@@ -1,7 +1,7 @@
 #define FD_SETSIZE 1
 #include <winsock.h>
-#include<string.h>
 #include "php-cgi-spawner.h"
+
 #pragma comment( lib, "kernel32.lib")
 #pragma comment( lib, "ws2_32.lib")
 
@@ -10,50 +10,36 @@
 typedef struct _PHPSPWCTX
 {
 	SOCKET s;
-	CRITICAL_SECTION cs;
+	CRITICAL_SECTION cs, cs_helper;
 	char* cmd;
+	char* path;
 	unsigned port;
 	unsigned fcgis;
 	unsigned helpers;
 	unsigned restart_delay;
 	char PHP_FCGI_MAX_REQUESTS[16];
 	char PHP_HELP_MAX_REQUESTS[16];
-	PROCESS_INFORMATION pi;//ProcessInfomation
-	STARTUPINFOA si;//StartupInfo
+	PROCESS_INFORMATION pi;
+	STARTUPINFOA si;
 	HANDLE hFCGIs[MAX_SPAWN_HANDLES];
+	LPHANDLE hHelperFCGIs;
 	unsigned helpers_delay;
 	volatile LONG helpers_running;
 } PHPSPWCTX;
-
 static PHPSPWCTX ctx;
-static bool RUNABLE;
-
+static BOOL RUNABLE;
 
 static __forceinline void memsym(void* mem, size_t size, char sym)
 {
 	while (size--)
 		((volatile char*)mem)[size] = sym;
 }
-void printError() {
-	DWORD systemLocale = MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL);
-	HLOCAL hLocal = NULL;
-	if (!FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_ALLOCATE_BUFFER,
-		NULL, GetLastError(), systemLocale, (LPWSTR)&hLocal, 0, NULL))
-	{
-		MessageBoxA(0, "Format message failed with 0x%x\n",0,0);
-		return;
-	}
 
-	MessageBox(0, (LPCWSTR)LocalLock(hLocal), 0, 0);
-
-}
 static char spawn_fcgi(HANDLE* hFCGI, BOOL is_perm)
 {
 	char isok = 1;
-
-	EnterCriticalSection(&ctx.cs);
-
-	for (;; )
+	if(is_perm) EnterCriticalSection(&ctx.cs);
+	for (; RUNABLE; )
 	{
 		// set correct PHP_FCGI_MAX_REQUESTS
 		{
@@ -70,10 +56,8 @@ static char spawn_fcgi(HANDLE* hFCGI, BOOL is_perm)
 			SetEnvironmentVariableA("PHP_FCGI_MAX_REQUESTS", val);
 		}
 
-		if (!CreateProcessA(NULL, ctx.cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-			NULL, NULL, &ctx.si, &ctx.pi))
+		if (!RUNABLE || !CreateProcessA(NULL, ctx.cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, ctx.path, &ctx.si, &ctx.pi))
 		{
-			printError();
 			isok = 0;
 			break;
 		}
@@ -82,16 +66,17 @@ static char spawn_fcgi(HANDLE* hFCGI, BOOL is_perm)
 		*hFCGI = ctx.pi.hProcess;
 		break;
 	}
-
-	LeaveCriticalSection(&ctx.cs);
-
+	if (is_perm) LeaveCriticalSection(&ctx.cs);
 	return isok;
 }
 
-static DWORD WINAPI helper_holder(HANDLE hFCGI)
+static DWORD WINAPI helper_holder(HANDLE _lphFCGI)
 {
+	LPHANDLE lphFCGI = (LPHANDLE)_lphFCGI;
+	HANDLE hFCGI = *lphFCGI;
 	WaitForSingleObject(hFCGI, INFINITE);
 	CloseHandle(hFCGI);
+	//*lphFCGI = INVALID_HANDLE_VALUE;
 	InterlockedDecrement(&ctx.helpers_running);
 	return 0;
 }
@@ -105,7 +90,7 @@ static DWORD WINAPI helpers_thread(void* unused)
 
 	for (;; )
 	{
-		DWORD dwTick = GetTickCount();
+		ULONGLONG dwTick = GetTickCount64();
 		timeout = &tv;
 
 		for (;; )
@@ -129,7 +114,7 @@ static DWORD WINAPI helpers_thread(void* unused)
 					continue;
 				}
 
-				if (GetTickCount() - dwTick > ctx.helpers_delay)
+				if (GetTickCount64() - dwTick > ctx.helpers_delay)
 					timeout = NULL;
 			}
 
@@ -147,11 +132,15 @@ static DWORD WINAPI helpers_thread(void* unused)
 
 		{
 			HANDLE h;
-
-			if (!spawn_fcgi(&h, FALSE))
-				break;
-
-			h = CreateThread(NULL, 0, &helper_holder, h, 0, NULL);
+			LPHANDLE hHelper = ctx.hHelperFCGIs;
+			EnterCriticalSection(&ctx.cs_helper);
+			for (; *hHelper != INVALID_HANDLE_VALUE; hHelper++);
+			if (!spawn_fcgi(hHelper, FALSE)){
+				LeaveCriticalSection(&ctx.cs_helper);
+			    break;
+			}
+			LeaveCriticalSection(&ctx.cs_helper);
+			h = CreateThread(NULL, 0, &helper_holder, hHelper, 0, NULL);
 
 			if (h == NULL)
 				break;
@@ -162,20 +151,40 @@ static DWORD WINAPI helpers_thread(void* unused)
 
 	return 0;
 }
-
+static void closeFCGIhHandles(LPHANDLE hHandles, size_t size) {
+	if (NULL == hHandles)return;
+	size_t i = 0;
+	for (; i < size; i++) {
+		HANDLE hProcess = hHandles[i];
+		if (INVALID_HANDLE_VALUE != hProcess) {
+			DWORD dwExitCode;
+			GetExitCodeProcess(hProcess, &dwExitCode); //获取退出码
+			if (dwExitCode == STILL_ACTIVE)
+			{
+				if (TerminateProcess(hProcess, 0))
+				{
+					WaitForSingleObject(hProcess, INFINITE);
+				}
+				hHandles[i] = INVALID_HANDLE_VALUE;
+			}
+			CloseHandle(hProcess);
+		}
+	}
+}
 static void perma_thread(BOOL helpers)
 {
-	for (;RUNABLE; )
+	for (; RUNABLE; )
 	{
 		unsigned i;
 
-		for (i = 0; i < ctx.fcgis && RUNABLE; i++)
+		for (i = 0; i < ctx.fcgis; i++)
 		{
-			if ((ctx.hFCGIs[i] == INVALID_HANDLE_VALUE &&
-				!spawn_fcgi(&ctx.hFCGIs[i], TRUE))|| !RUNABLE)
+			if (!RUNABLE) return;
+			if (ctx.hFCGIs[i] == INVALID_HANDLE_VALUE && !spawn_fcgi(&ctx.hFCGIs[i], TRUE))
 				return;
 		}
-		if (helpers && RUNABLE)
+
+		if (helpers)
 		{
 			HANDLE h;
 
@@ -192,14 +201,13 @@ static void perma_thread(BOOL helpers)
 			Sleep(INFINITE);
 
 		WaitForMultipleObjects(ctx.fcgis, ctx.hFCGIs, FALSE, INFINITE);
-
-		for (i = 0; i < ctx.fcgis && RUNABLE; i++)
+		for (i = 0; i < ctx.fcgis; i++)
 		{
 			if (ctx.hFCGIs[i] != INVALID_HANDLE_VALUE)
 			{
 				DWORD dwExitCode;
 				if (!GetExitCodeProcess(ctx.hFCGIs[i], &dwExitCode))
-					return;
+					continue;
 
 				if (dwExitCode != STILL_ACTIVE)
 				{
@@ -216,32 +224,41 @@ static void perma_thread(BOOL helpers)
 	}
 }
 
-#define IS_QUOTE( c ) ( c == '"' )
-#define IS_SPACE( c ) ( c == ' ' || c == '\t' )
+void __cdecl RunSpawner(const char* cmd, const char* path, int iLocalPort, int iMinChildren, int iMaxChildren, int iRestartDelay)
+{
+	if (NULL == cmd) return;
+	size_t iCmdLen = strlen(cmd) + 1, iPathLen = strlen(path) + 1;
+	LPSTR sCmd = (LPSTR)LocalAlloc(LMEM_ZEROINIT, iCmdLen), sPath = NULL;
+	if (NULL == sCmd) { return; }
+	if (NULL != path) {
+		sPath = (LPSTR)LocalAlloc(LMEM_ZEROINIT, iCmdLen);
+		if (NULL == sPath) {
+			LocalFree(sCmd);
+			return;
+		}
+		strcpy_s(sPath, iPathLen, path);
+	}
+	strcpy_s(sCmd, iCmdLen, cmd);
 
-
-void RunSpawner(const char* cmd, int iLocalPort, int iStartServers,int iMaxChildren, int iRestartDelay) {
-	int iCmdLen = strlen(cmd);
-
-	char *sCmd = (char*)malloc(iCmdLen+1);
-	ZeroMemory(sCmd, iCmdLen + 1);
-	strcpy_s(sCmd, iCmdLen + 1, cmd);
-	RUNABLE = true;
-	for (;RUNABLE; )
+	for (;; )
 	{
 		BOOL is_helpers = FALSE;
 
 		ctx.cmd = sCmd;
+		ctx.path = sPath;
 		ctx.port = iLocalPort;
 
-		// permanent fcgis + helpers count
-		{
-			ctx.helpers = iStartServers;
-			if (ctx.helpers)
-				is_helpers = TRUE;
+		// fcgis(min) + helpers = iMaxChildren
+		if (iMaxChildren > iMinChildren) {
+			ctx.helpers = iMaxChildren - iMinChildren;
+			is_helpers = TRUE;
+			// (LPHANDLE)LocalAlloc(LMEM_ZEROINIT, sizeof(HANDLE) * ctx.helpers);
+			ctx.hHelperFCGIs = (LPHANDLE)malloc(sizeof(HANDLE) * ctx.helpers);
+			//memsym(ctx.hFCGIs, sizeof(ctx.hFCGIs), -1);
+			for (size_t i = 0; i < ctx.helpers; i++)ctx.hHelperFCGIs[i] = INVALID_HANDLE_VALUE;
 		}
 
-		ctx.fcgis = iMaxChildren;
+		ctx.fcgis = iMinChildren;
 		ctx.restart_delay = iRestartDelay;
 		ctx.helpers_delay = ctx.restart_delay ? ctx.restart_delay : 100;
 
@@ -268,7 +285,7 @@ void RunSpawner(const char* cmd, int iLocalPort, int iStartServers,int iMaxChild
 			fcgi_addr_in.sin_addr.s_addr = 0x0100007f; // 127.0.0.1
 			fcgi_addr_in.sin_port = htons((unsigned short)ctx.port);
 
-			if (-1 == bind(ctx.s, (struct sockaddr*) & fcgi_addr_in,
+			if (-1 == bind(ctx.s, (struct sockaddr*)&fcgi_addr_in,
 				sizeof(fcgi_addr_in)))
 				break;
 
@@ -286,6 +303,7 @@ void RunSpawner(const char* cmd, int iLocalPort, int iStartServers,int iMaxChild
 			SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 
 		InitializeCriticalSection(&ctx.cs);
+		InitializeCriticalSection(&ctx.cs_helper);
 
 		ctx.PHP_FCGI_MAX_REQUESTS[0] = 0;
 		GetEnvironmentVariableA("PHP_FCGI_MAX_REQUESTS",
@@ -309,32 +327,36 @@ void RunSpawner(const char* cmd, int iLocalPort, int iStartServers,int iMaxChild
 		perma_thread(is_helpers);
 		break;
 	}
-
-	//return  0;
+	if (sCmd != NULL)LocalFree(sCmd);
+	if (sPath != NULL)LocalFree(sPath);
+	StopSpawner();
+	//ExitProcess(0);
 }
+
 void StopSpawner() {
 	if (!RUNABLE)return;
-	RUNABLE = false;
-	unsigned i;
-	for (i = 0; i < ctx.fcgis; i++)
-	{
-		DWORD exitCode; //退出码
-		//PROCESS_INFORMATION pro_info = ctx.pi;
-		HANDLE hProcess = ctx.hFCGIs[i];
-		GetExitCodeProcess(hProcess, &exitCode); //获取退出码
-		TerminateProcess(hProcess, exitCode);
-		// 关闭句柄
-		//CloseHandle(pro_info.hThread);
-		CloseHandle(hProcess);
-		//if (ctx.hFCGIs[i] != INVALID_HANDLE_VALUE &&
-		//	!spawn_fcgi(&ctx.hFCGIs[i], TRUE))
-		//	return;
-	}
+	RUNABLE = FALSE;
+	EnterCriticalSection(&ctx.cs_helper);
+	closeFCGIhHandles(ctx.hHelperFCGIs, ctx.helpers);
+	LeaveCriticalSection(&ctx.cs_helper);
+
+	EnterCriticalSection(&ctx.cs);
+	closeFCGIhHandles(ctx.hFCGIs, ctx.fcgis);
+	LeaveCriticalSection(&ctx.cs);
 }
-BOOL WINAPI DllMain(
-	_In_ HINSTANCE hinstDLL,
-	_In_ DWORD     fdwReason,
-	_In_ LPVOID    lpvReserved
-) {
-	return TRUE;
+
+void ReloadSpawner(LPCGI_PROFILE profile) {
+	if (!RUNABLE) RunSpawnerProfile(profile);
+	EnterCriticalSection(&ctx.cs_helper);
+	closeFCGIhHandles(ctx.hHelperFCGIs, ctx.helpers);
+	LeaveCriticalSection(&ctx.cs_helper);
+
+	closeFCGIhHandles(ctx.hFCGIs, ctx.fcgis);
+}
+DWORD RunSpawnerProfile(void* vProfile) {
+	if (NULL == vProfile) return -1;
+	LPCGI_PROFILE profile = (LPCGI_PROFILE)vProfile;
+	RUNABLE = TRUE;
+	RunSpawner(profile->cgiStartCmd, profile->cgiWorkPath, profile->cgiPort, profile->cgiMinChildren, profile->cgiMaxChildren, profile->cgiRestartDelay);
+	return 0;
 }

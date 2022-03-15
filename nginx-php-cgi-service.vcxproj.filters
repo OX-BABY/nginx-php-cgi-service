@@ -15,10 +15,16 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="php-cgi-spawner.cpp">
+    <ClCompile Include="nginx-php-cgi-service.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
-    <ClCompile Include="nginx-php-cgi-service.cpp">
+    <ClCompile Include="s-pipe.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="smap.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="php-cgi-spawner.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
@@ -26,7 +32,16 @@
     <ClInclude Include="php-cgi-spawner.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="nginx-php-cgi.h">
+    <ClInclude Include="nginx-php-cgi-service.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="s-pipe.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="global.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="smap.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

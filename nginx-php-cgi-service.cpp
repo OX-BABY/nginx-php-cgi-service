@@ -1,58 +1,134 @@
 #include <windows.h>
 #include <tchar.h>
 #include <strsafe.h>
-#include <atlconv.h>  
+#include <atlconv.h>
 #include "php-cgi-spawner.h"
-#include "nginx-php-cgi.h"
+#include "nginx-php-cgi-service.h"
+#include "s-pipe.h"
+#include "smap.h"
 #pragma comment(lib, "advapi32.lib")
 
-#define SVCNAME "nginx-php"
-#define STR_BUFF_SIZE 1024
-SERVICE_STATUS          gSvcStatus;
-SERVICE_STATUS_HANDLE   gSvcStatusHandle;
-HANDLE                  ghSvcStopEvent = NULL;
-FILE* fpFile;
-char* nginxStartCmd, * nginxStopCmd, * nginxWorkPath;
-char* cgiStartCmd;
-int cgiMaxChildren, cgiStartServers, cgiPort, cgiRestartDelay;
+#define SVCNAME TEXT("nginx-php")
 
-char szPath[MAX_PATH];
 void SvcInstall(void);
-void OutputLastError();
 void SvcUninstall(void);
+BOOL CtrlHandler(DWORD fdwctrltype);
 void WINAPI SvcCtrlHandler(DWORD);
 void WINAPI SvcMain(DWORD, LPTSTR*);
 
 void ReportSvcStatus(DWORD, DWORD, DWORD);
 void SvcInit(DWORD, LPTSTR*);
 void SvcReportEvent(LPTSTR);
+BOOL initLog(LPCTSTR path);
+int ReadAllProfile(LPCTSTR lpFileName);
+BOOL StartSpawner(LPCGI_PROFILE);
+typedef struct _EXE_PROFILE {
+	size_t iConfigCount = 0;
+	LPTSTR pStartCmd;
+	LPTSTR pStopCmd;
+	LPTSTR pReloadCmd;
+	LPTSTR pWorkPath;
+	PROCESS_INFORMATION PI;//nginxProcessInfomation
+	STARTUPINFO SI;
+	LPSMAP lpSmap;
+} EXE_PROFILE, * LPEXE_PROFILE;
 
-static int WriteLogFile(const char* msg) {
-	if (NULL != fpFile) {
-		int count = fputs(msg, fpFile);
-		fflush(fpFile);
-		return count;
-	}
-	return -1;
-}
-static void GetLastFormatError(char* buf, size_t buf_size) {
-	DWORD systemLocale = MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL),err_code= GetLastError();
-	HLOCAL hLocal = NULL;
-	if (!FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_ALLOCATE_BUFFER,
-		NULL, err_code, systemLocale, (LPSTR)&hLocal, 0, NULL))
+LPSMAP lpProfileMap;
+
+LPEXE_PROFILE ReadExeProfile(LPCTSTR name,LPCTSTR lpFileName,BOOL fReload);
+LPCGI_PROFILE ReadCGIProfile();
+
+
+SERVICE_STATUS          gSvcStatus;
+SERVICE_STATUS_HANDLE   gSvcStatusHandle;
+HANDLE                  ghSvcStopEvent = NULL;
+LPEXE_PROFILE nginxProfile = NULL;
+LPCGI_PROFILE cgiProfile = NULL;
+FILE* fFile = NULL;
+
+TCHAR szPath[MAX_PATH];
+char szPathA[MAX_PATH*sizeof(TCHAR)];
+void DestoryALL() {
+	/*ResetEvent(lpPipeInst->oOverlap.hEvent);*/
+	if (NULL != lpProfileMap)
 	{
-		sprintf_s(buf, buf_size, "Format message failed with 0x%x\n", GetLastError());
+		destorySmap(&lpProfileMap);
+		lpProfileMap = NULL;
+	}
+	if (NULL != cgiProfile) {
+		free(cgiProfile->cgiStartCmd);
+		free(cgiProfile);
+	}
+	//DisconnectAndClose(NULL);
+	WriteLog(TEXT("Destoried ALL\n"));
+	fclose(fFile);
+	fFile = NULL;
+}
+BOOL initLog(LPCTSTR lpFileName) {
+	if (NULL == fFile) {
+		if (NULL == lpFileName)return FALSE;
+		fFile = _tfsopen(lpFileName, TEXT("a+"), _SH_DENYWR);
+		if (NULL == fFile) {
+			printf("CreateFile Error %d\n", GetLastError());
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+size_t WriteLog(LPCTSTR fmt) {
+	if (NULL == fmt) return 0;
+	int iWrite;
+	if (NULL != fFile) {
+		iWrite = _fputts(fmt, fFile);
+	}
+	else {
+		iWrite = _putts(fmt);
+	}
+	return iWrite;
+}
+size_t WriteLogF(LPCTSTR fmt, ...) {
+	if (NULL == fmt) return 0;
+	int iWrited = 0;
+	va_list list = NULL;
+	va_start(list, fmt);
+	if (NULL != fFile) {
+		iWrited = _vftprintf(fFile, fmt, list);
+		_vtprintf(fmt, list);
+		//if (fmt[lstrlen(fmt)] != '\n') {
+		//	_ftprintf(fFile, TEXT(""));
+		//	puts("\n");
+		//}
+	}
+	else {
+		iWrited = _vtprintf(fmt, list);
+		//if (fmt[lstrlen(fmt)] != '\n') {
+		//	puts("\n");
+		//}
+	}
+	va_end(list);
+	return iWrited;
+}
+void GetLastFormatError(LPTSTR buff, size_t buf_size) {
+	DWORD systemLocale = MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL), err_code = GetLastError();
+	HLOCAL hLocal = NULL;
+	if (!FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_ALLOCATE_BUFFER,
+		NULL, err_code, systemLocale, (LPTSTR)&hLocal, 0, NULL))
+	{
+		StringCbPrintf(buff, buf_size, TEXT("格式化错误消息失败，错误代码 %d\n"), GetLastError());
 		return;
 	}
-	sprintf_s(buf, buf_size, "Error Code: %u %s\n", err_code, (const char *)hLocal);
+	StringCbPrintf(buff, buf_size, TEXT("错误代码: %u %s\n"), err_code, (LPCTSTR)hLocal);
 	LocalFree(hLocal);
 }
 void OutputLastError()
 {
-	char* buff = (char*)malloc(STR_BUFF_SIZE);
-	GetLastFormatError(buff, STR_BUFF_SIZE);
-	printf(buff);
-	free(buff);
+	LPTSTR buff = (LPTSTR)malloc(STR_BUFF_SIZE);
+	if (NULL != buff)
+	{
+		GetLastFormatError(buff, STR_BUFF_SIZE);
+		WriteLog(buff);
+		free(buff);
+	}
 }
 //
 // Purpose: 
@@ -68,7 +144,7 @@ void __cdecl _tmain(int argc, TCHAR* argv[])
 {
 	// If command-line parameter is "install", install the service. 
 	// Otherwise, the service is probably being started by the SCM.
-	if (argc > 1 && !GetModuleFileNameA(NULL, szPath, MAX_PATH))
+	if (argc > 1 && !GetModuleFileName(NULL, szPath, MAX_PATH))
 	{
 		OutputLastError();
 		return;
@@ -87,10 +163,18 @@ void __cdecl _tmain(int argc, TCHAR* argv[])
 		SvcInstall();
 		return;
 	}
+	else if (lstrcmpi(argv[1], TEXT("debug")) == 0) {
+		if (SetConsoleCtrlHandler((PHANDLER_ROUTINE)CtrlHandler, TRUE))
+		{
+			WriteLog(TEXT("the control handler is installed."));
+		}
+		SvcInit(argc,argv);
+		return;
+	}
 	// TO_DO: Add any additional services for the process to this table.
 	SERVICE_TABLE_ENTRY DispatchTable[] =
 	{
-		{ TEXT(SVCNAME), (LPSERVICE_MAIN_FUNCTION)SvcMain },
+		{ SVCNAME, (LPSERVICE_MAIN_FUNCTION)SvcMain },
 		{ NULL, NULL }
 	};
 
@@ -103,8 +187,6 @@ void __cdecl _tmain(int argc, TCHAR* argv[])
 	}
 
 }
-PROCESS_INFORMATION nginxPi;//nginxProcessInfomation
-STARTUPINFOA nginxSi;
 //
 // Purpose: 
 //   Installs a service in the SCM database
@@ -134,7 +216,7 @@ void SvcInstall()
 
 	// Create the service
 
-	schService = CreateServiceA(
+	schService = CreateService(
 		schSCManager,              // SCM database 
 		SVCNAME,                   // name of service 
 		SVCNAME,                   // service name to display 
@@ -177,7 +259,7 @@ void SvcUninstall() {
 		return;
 	}
 
-	schService = OpenServiceA(
+	schService = OpenService(
 		schSCManager,       // SCM database 
 		SVCNAME,          // name of service 
 		DELETE);
@@ -214,7 +296,7 @@ void WINAPI SvcMain(DWORD dwArgc, LPTSTR* lpszArgv)
 {
 	// Register the handler function for the service
 
-	gSvcStatusHandle = RegisterServiceCtrlHandlerA(SVCNAME, SvcCtrlHandler);
+	gSvcStatusHandle = RegisterServiceCtrlHandler(SVCNAME, SvcCtrlHandler);
 
 	if (!gSvcStatusHandle)
 	{
@@ -258,13 +340,13 @@ void SvcInit(DWORD dwArgc, LPTSTR* lpszArgv)
 
 	// Create an event. The control handler function, SvcCtrlHandler,
 	// signals this event when it receives the stop control code.
-
+	DWORD dwPathLen;
 	ghSvcStopEvent = CreateEventA(
 		NULL,    // default security attributes
 		TRUE,    // manual reset event
 		FALSE,   // not signaled
 		NULL);   // no name
-
+	ReportSvcStatus(SERVICE_START_PENDING, NO_ERROR, 0);
 	if (ghSvcStopEvent == NULL)
 	{
 		ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
@@ -273,93 +355,79 @@ void SvcInit(DWORD dwArgc, LPTSTR* lpszArgv)
 
 	// Report running status when initialization is complete.
 
-
-	ReportSvcStatus(SERVICE_RUNNING, NO_ERROR, 0);
-	if (!GetModuleFileNameA(NULL, szPath, MAX_PATH))
+	dwPathLen = GetModuleFileName(NULL, szPath, MAX_PATH);
+	if (dwPathLen<=0|| dwPathLen>MAX_PATH)
 	{
-		ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
+		ReportSvcStatus(SERVICE_STOPPED, ERROR_INVALID_VARIANT, 0);
 		return;
 	}
-	int szPathLen = strnlen_s(szPath, STR_BUFF_SIZE);
-	char szHFilePath[MAX_PATH] = { 0 };
-	memcpy_s(szHFilePath, szPathLen, szPath, szPathLen);
 
-	szPath[szPathLen - 3] = 'i';
-	szPath[szPathLen - 2] = 'n';
-	szPath[szPathLen - 1] = 'i';
+	TCHAR szLogFilePath[MAX_PATH] = { 0 };
+	lstrcpy(szLogFilePath, szPath);
+	//memcpy_s(szLogFilePath, MAX_PATH, szPath, dwPathLen);
+	lstrcpy(szPath + dwPathLen - 3, TEXT("ini"));
+	lstrcpy(szLogFilePath + dwPathLen - 3, TEXT("log"));
 
-	szHFilePath[szPathLen - 3] = 'l';
-	szHFilePath[szPathLen - 2] = 'o';
-	szHFilePath[szPathLen - 1] = 'g';
-	fopen_s(&fpFile, szHFilePath, "a+");
-	if (NULL == fpFile) {
-		ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
+	WideCharToMultiByte(65001, 0, szPath, -1, szPathA, MAX_PATH * sizeof(TCHAR), NULL, NULL);
+
+	if (!initLog(szLogFilePath)) {
+		ReportSvcStatus(SERVICE_STOPPED, ERROR_INVALID_VARIANT, 0);
 		return;
 	}
-	// TO_DO: Perform work until service stops.
-	nginxStartCmd = (char*)malloc(STR_BUFF_SIZE);
-	nginxStopCmd = (char*)malloc(STR_BUFF_SIZE);
-	nginxWorkPath = (char*)malloc(STR_BUFF_SIZE);
-	GetPrivateProfileStringA("Nginx", "startCmd", NULL, nginxStartCmd, STR_BUFF_SIZE, szPath);
-	GetPrivateProfileStringA("Nginx", "stopCmd", NULL, nginxStopCmd, STR_BUFF_SIZE, szPath);
-	GetPrivateProfileStringA("Nginx", "workPath", NULL, nginxWorkPath, STR_BUFF_SIZE, szPath);
+	WriteLog(TEXT("Service Begin Init\n"));
+	
+	if (!RunPipe(TEXT("\\\\.\\pipe\\nginx_php_cgi_service"))) {
+		ReportSvcStatus(SERVICE_STOPPED, ERROR_INVALID_VARIANT, 0);
+		//TODO
+		return;
+	}
+	
+	ReadAllProfile(szPath);
+	nginxProfile = ReadExeProfile(TEXT("Nginx"), szPath,FALSE);
+	cgiProfile    = ReadCGIProfile();
 
-	cgiStartCmd = (char*)malloc(STR_BUFF_SIZE);
-	GetPrivateProfileStringA("PHP_FPM", "startCmd", NULL, cgiStartCmd, STR_BUFF_SIZE, szPath);
-	cgiMaxChildren = GetPrivateProfileIntA("PHP_FPM", "StartServers", 2, szPath);
-	cgiStartServers = GetPrivateProfileIntA("PHP_FPM", "MaxChildren", 4, szPath);
-	cgiPort = GetPrivateProfileIntA("PHP_FPM", "LocalPort", 9000, szPath);
-	cgiRestartDelay = GetPrivateProfileIntA("PHP_FPM", "RestartDelay", 0, szPath);
-
-	//WriteLogFile(nginxStartCmd);
-	//WriteLogFile(nginxStopCmd);
-	//WriteLogFile(nginxWorkPath);
-	//WriteLogFile(cgiStartCmd);
-	//GetPrivateProfileStringA("Main", "Fpm", "2+4", fpm, STR_BUFF_SIZE, szPath);
-
-	ZeroMemory(&nginxSi, sizeof(nginxSi));
-	nginxSi.cb = sizeof(nginxSi);
-	ZeroMemory(&nginxPi, sizeof(nginxPi));
-
-	if (strlen(nginxStartCmd) > 0) {
-		DWORD systemLocale = MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL);
-		HLOCAL hLocal = NULL;
-		char* buf = (char*)malloc(STR_BUFF_SIZE);
-		if (!CreateProcessA(NULL, nginxStartCmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-			NULL, nginxWorkPath, &nginxSi, &nginxPi)) {
-			OutputLastError();
-			sprintf_s(buf, STR_BUFF_SIZE, "Failed create process%s.\n", nginxStartCmd);
-			WriteLogFile((LPSTR)&hLocal);
-			free(buf);
-			free(nginxStartCmd);
-			free(nginxStopCmd);
-			ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
-			return;
-		}
-		//CloseHandle(nginxPi.hProcess);
-		CloseHandle(nginxPi.hThread);
-		free(buf);
+	if (nginxProfile == NULL) {
+		WriteLog(TEXT("Failed ReadExeProfile\n"));
+		ReportSvcStatus(SERVICE_STOPPED, ERROR_INVALID_VARIANT, 0);
+		return;
+	}
+	if (cgiProfile == NULL) {
+		WriteLog(TEXT("Failed ReadCGIProfile\n"));
+		ReportSvcStatus(SERVICE_STOPPED, ERROR_INVALID_VARIANT, 0);
+		return;
+	}
+	else if (!StartSpawner(cgiProfile)) {
+		WriteLog(TEXT("Failed Start PHP-CGI\n"));
+		ReportSvcStatus(SERVICE_STOPPED, ERROR_INVALID_VARIANT, 0);
+		return;
+	}
+	if (RunExec(TEXT("Nginx"), CMD_START, NULL)) {
+		WriteLog(TEXT("Nginx Process Start up Success\n"));
 	}
 	else {
-		WriteLogFile("Please confirm the configuration file\n");
-		free(nginxStartCmd);
-		free(nginxStopCmd);
-		ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
-		return;
+		OutputLastError();
+		ReportSvcStatus(SERVICE_STOPPED, ERROR_INVALID_VARIANT, 0);
 	}
+	
+	//RunSpawner(cgiStartCmd, cgiPort, cgiStartServers, cgiMaxChildren, cgiRestartDelay);
 
-	WriteLogFile("Nginx Process Start up Success");
-	RunSpawner(cgiStartCmd, cgiPort, cgiStartServers, cgiMaxChildren, cgiRestartDelay);
-	WriteLogFile("Run php-cgi Done");
+	WriteLog(TEXT("Run php-cgi Done\n"));
+	ReportSvcStatus(SERVICE_RUNNING, NO_ERROR, 0);
 	while (1)
 	{
-		// Check whether to stop the service.
-
 		WaitForSingleObject(ghSvcStopEvent, INFINITE);
+		ReportSvcStatus(SERVICE_STOP_PENDING, NO_ERROR, 0);
+		if (NULL != nginxProfile)
+		{
+			RunExec(TEXT("Nginx"), CMD_STOP, NULL);
+			WriteLog(TEXT("Stop Nginx Done\n"));
+		}
+
+		StopSpawner();
+		WriteLog(TEXT("StopSpawner Done\n"));
+		DestoryALL();
 		ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
-		free(nginxStartCmd);
-		free(nginxStopCmd);
-		return;
+		break;
 	}
 }
 
@@ -410,6 +478,32 @@ void ReportSvcStatus(DWORD dwCurrentState, DWORD dwWin32ExitCode, DWORD dwWaitHi
 // Return value:
 //   None
 //
+BOOL CtrlHandler(DWORD fdwctrltype)
+{
+	switch (fdwctrltype)
+	{
+		// handle the ctrl-c signal.
+	case CTRL_C_EVENT:
+		printf("ctrl-c event\n\n");
+	case CTRL_CLOSE_EVENT:
+		printf("ctrl-close event\n\n");
+		SvcCtrlHandler(SERVICE_CONTROL_STOP);
+		return FALSE;
+		// pass other signals to the next handler.
+	case CTRL_BREAK_EVENT:
+		printf("ctrl-break event\n\n");
+		return FALSE;
+	case CTRL_LOGOFF_EVENT:
+		printf("ctrl-logoff event\n\n");
+		return FALSE;
+	case CTRL_SHUTDOWN_EVENT:
+		printf("ctrl-shutdown event\n\n");
+		return FALSE;
+	default:
+		return FALSE;
+	}
+}
+
 void WINAPI SvcCtrlHandler(DWORD dwCtrl)
 {
 	// Handle the requested control code. 
@@ -417,37 +511,18 @@ void WINAPI SvcCtrlHandler(DWORD dwCtrl)
 	switch (dwCtrl)
 	{
 	case SERVICE_CONTROL_SHUTDOWN:
+		WriteLog(TEXT("Recv SERVICE_CONTROL_SHUTDOWN\n"));
 	case SERVICE_CONTROL_STOP:
-		ReportSvcStatus(SERVICE_STOP_PENDING, NO_ERROR, 0);
-		STARTUPINFOA si;
-		PROCESS_INFORMATION pi;
-		ZeroMemory(&si, sizeof(si));
-		nginxSi.cb = sizeof(si);
-		ZeroMemory(&pi, sizeof(pi));
-		StopSpawner();
-		WriteLogFile("StopSpawner Done");
-		CreateProcessA(NULL, nginxStopCmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, nginxWorkPath, &si, &pi);
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-		WaitForSingleObject(nginxPi.hProcess, 2000);
-		WriteLogFile("Stop Nginx Done");
-		//CloseHandle(pi.hProcess);
-		//DWORD dwExitCode;
-		//GetExitCodeProcess(pi.hProcess, &dwExitCode);
-
-		// Signal the service to stop.
+		WriteLog(TEXT("Recv SERVICE_CONTROL_STOP\n"));
 		SetEvent(ghSvcStopEvent);
-		ReportSvcStatus(gSvcStatus.dwCurrentState, NO_ERROR, 0);
-
-		return;
-
+		//ReportSvcStatus(gSvcStatus.dwCurrentState, NO_ERROR, 0);
+		break;
 	case SERVICE_CONTROL_INTERROGATE:
 		break;
 
 	default:
 		break;
 	}
-
 }
 
 //
@@ -466,19 +541,18 @@ void WINAPI SvcCtrlHandler(DWORD dwCtrl)
 void SvcReportEvent(LPTSTR szFunction)
 {
 	HANDLE hEventSource;
-	LPCSTR lpszStrings[2];
-	char Buffer[80];
-
-	hEventSource = RegisterEventSourceA(NULL, SVCNAME);
+	LPCTSTR lpszStrings[2];
+	TCHAR Buffer[80];
+	hEventSource = RegisterEventSource(NULL, SVCNAME);
 
 	if (NULL != hEventSource)
 	{
-		StringCchPrintfA(Buffer, 80, "%s failed with %d", szFunction, GetLastError());
+		StringCchPrintf(Buffer, 80, TEXT("%s failed with %d"), szFunction, GetLastError());
 
 		lpszStrings[0] = SVCNAME;
 		lpszStrings[1] = Buffer;
 
-		ReportEventA(hEventSource,        // event log handle
+		ReportEvent(hEventSource,        // event log handle
 			EVENTLOG_ERROR_TYPE, // event type
 			0,                   // event category
 			SVC_ERROR,           // event identifier
@@ -490,4 +564,184 @@ void SvcReportEvent(LPTSTR szFunction)
 
 		DeregisterEventSource(hEventSource);
 	}
+}
+BOOL RunCmd(LPTSTR cmd, LPCTSTR args, LPCTSTR path, LPSTARTUPINFO lpsi, LPPROCESS_INFORMATION lppi) {
+	if (cmd == NULL)return FALSE;
+	LPTSTR _cmd = (LPTSTR)LocalAlloc(LMEM_ZEROINIT, STR_BUFF_SIZE);
+	if (NULL == _cmd)
+		return FALSE;
+	if (NULL == args)
+		//memcpy_s(_cmd, STR_BUFF_SIZE, cmd, lstrlen(cmd) * sizeof(TCHAR));
+		//StringCbCopy(_cmd, STR_BUFF_SIZE_A, cmd);
+		lstrcpy(_cmd, cmd);
+	else
+		StringCbPrintf(_cmd, STR_BUFF_SIZE, TEXT("%s %s"), cmd, args);
+	BOOL success = CreateProcess(NULL, _cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, path, lpsi, lppi);
+	if (!success) {
+		LPTSTR errmsg = (LPTSTR)malloc(STR_BUFF_SIZE);
+		if (NULL != errmsg)
+		{
+			GetLastFormatError(errmsg, STR_BUFF_SIZE);
+			WriteLog(errmsg);
+			free(errmsg);
+		}
+		WriteLog(_cmd);
+	}
+	LocalFree(_cmd);
+	return success;
+}
+BOOL RunExec(LPCTSTR name, int option, LPCTSTR args) {
+	LPSMAP node = findSmap(lpProfileMap, name);
+	if (NULL == node||NULL == node->value)return FALSE;
+
+	LPEXE_PROFILE profile = (LPEXE_PROFILE)node->value;
+	BOOL bSuccess = TRUE;
+	if (option == CMD_RELOAD) {
+		bSuccess = RunCmd(profile->pReloadCmd, args, profile->pWorkPath, &profile->SI, &profile->PI);
+	}
+	else {
+		if (option & CMD_STOP)
+		{
+			bSuccess = RunCmd(profile->pStopCmd, args, profile->pWorkPath, &profile->SI, &profile->PI);
+		}
+		if ((option & CMD_START) && bSuccess) {
+			if (option & CMD_STOP) {
+				WaitForSingleObject(profile->PI.hProcess, 1000);
+			}
+			bSuccess = RunCmd(profile->pStartCmd, args, profile->pWorkPath, &profile->SI, &profile->PI);
+		}
+	}
+	return bSuccess;
+}
+void DestoryProfile(LPEXE_PROFILE lpExeProfile) {
+	if (NULL == lpExeProfile) return;
+	LocalFree((HLOCAL)lpExeProfile->pStartCmd);
+	LocalFree((HLOCAL)lpExeProfile->pStopCmd);
+	LocalFree((HLOCAL)lpExeProfile->pReloadCmd);
+	LocalFree((HLOCAL)lpExeProfile->pWorkPath);
+	LocalFree((HLOCAL)lpExeProfile);
+}
+
+int ReadAllProfile(LPCTSTR lpFileName) {
+	int c = 0;
+	HLOCAL hNames = LocalAlloc(LMEM_ZEROINIT, STR_BUFF_SIZE);
+	if (NULL == hNames)return c;
+	LPTSTR lpNames = (LPTSTR)hNames;
+	DWORD dwNameLength;
+
+	dwNameLength = GetPrivateProfileSectionNames(lpNames, STR_BUFF_SIZE_A, lpFileName);
+	for (DWORD i = 0; i < dwNameLength; i++, lpNames += i)
+	{
+		WriteLogF(L"Read Process Section %s\n", lpNames);
+		ReadExeProfile(lpNames, lpFileName, TRUE);
+		c++;
+		i += lstrlen(lpNames);
+	}
+
+	LocalFree((HLOCAL)hNames);
+	return c;
+}
+LPEXE_PROFILE ReadExeProfile(LPCTSTR lpNames, LPCTSTR lpFileName, BOOL fReload) {
+	LPSMAP smap = findSmap(lpProfileMap, lpNames);
+	LPEXE_PROFILE profile = NULL == smap ? NULL : (LPEXE_PROFILE)smap->value;
+	if (!fReload) {
+		return profile;
+	} else {
+		DestoryProfile(profile);
+		deleteSmap(lpProfileMap, smap);
+	}
+	LPTSTR hContent = (LPTSTR)LocalAlloc(LMEM_ZEROINIT, STR_BUFF_SIZE), lpContent = hContent;
+	if (NULL == hContent) {
+		return NULL;
+	}
+	profile = (LPEXE_PROFILE)LocalAlloc(LMEM_ZEROINIT, sizeof(EXE_PROFILE));
+	if (NULL == profile) {
+		LocalFree((HLOCAL)hContent);
+		return NULL;
+	}
+	DWORD dwContentLength = GetPrivateProfileSection(lpNames, lpContent, STR_BUFF_SIZE_A, lpFileName), dwWrited = 0;
+
+	for (DWORD i = 0; i < dwContentLength; i += dwWrited, lpContent += dwWrited) {
+		dwWrited = lstrlen(lpContent)+1;
+		LPTSTR iPos = lstrchr(lpContent, '=');
+		if (NULL == iPos)
+		{
+			continue;
+		}
+		//=设置为空，相当于分割字符串.
+		*(iPos++) = 0;
+		int iLenKey = lstrlen(lpContent) + 1, iLenValue = lstrlen(iPos) + 1;
+
+		LPTSTR lpKey = (LPTSTR)LocalAlloc(LMEM_ZEROINIT, iLenKey * sizeof(TCHAR)), lpValue = NULL;
+		if (NULL == lpKey)continue;
+		lpValue = (LPTSTR)LocalAlloc(LMEM_ZEROINIT, iLenValue * sizeof(TCHAR));
+		if (NULL == lpValue) {
+			LocalFree((HLOCAL)lpKey);
+			continue;
+		}
+		lstrcpy(lpKey, lpContent);
+		lstrcpy(lpValue, iPos);
+
+		//profile->map.insert(std::pair<LPTSTR,LPTSTR>(lpKey,lpValue));
+		if (!lstrcmp(TEXT("startCmd"), lpKey)) {
+			profile->pStartCmd = lpValue;
+		}
+		else if (!lstrcmp(TEXT("stopCmd"), lpKey)) {
+			profile->pStopCmd = lpValue;
+		}
+		else if (!lstrcmp(TEXT("reloadCmd"), lpKey)) {
+			profile->pReloadCmd = lpValue;
+		}
+		else if (!lstrcmp(TEXT("workPath"), lpKey)) {
+			profile->pWorkPath = lpValue;
+		}
+
+		LocalFree((HLOCAL)lpKey);
+		(profile->iConfigCount)++;
+	}
+
+	LocalFree((HLOCAL)hContent);
+	if (profile->pStartCmd == NULL || profile->iConfigCount > 0) {
+		appendSmap(&lpProfileMap, lpNames, profile);
+		return profile;
+	}
+	else {
+		LocalFree((HLOCAL)profile);
+		return NULL;
+	}
+	return profile;
+}
+
+LPCGI_PROFILE ReadCGIProfile() {
+	LPCGI_PROFILE profile = (LPCGI_PROFILE)malloc(sizeof(CGI_PROFILE));
+	if (NULL == profile)return NULL;
+	profile->cgiStartCmd = (char*)malloc(STR_BUFF_SIZE);
+	profile->cgiWorkPath = (char*)malloc(STR_BUFF_SIZE);
+	if (NULL == profile->cgiStartCmd) {
+		free(profile);
+		return NULL;
+	}
+	
+	GetPrivateProfileStringA("PHP_FPM", "startCmd", NULL, profile->cgiStartCmd, STR_BUFF_SIZE, szPathA);
+	GetPrivateProfileStringA("PHP_FPM", "workPath", NULL, profile->cgiWorkPath, STR_BUFF_SIZE, szPathA);
+	
+	profile->cgiMinChildren = GetPrivateProfileIntA("PHP_FPM", "MinChildren", 2, szPathA);
+	profile->cgiMaxChildren = GetPrivateProfileIntA("PHP_FPM", "MaxChildren", 4, szPathA);
+	profile->cgiPort = GetPrivateProfileIntA("PHP_FPM", "LocalPort", 9000, szPathA);
+	profile->cgiRestartDelay = GetPrivateProfileIntA("PHP_FPM", "RestartDelay", 0, szPathA);
+	if (strlen(profile->cgiStartCmd) <= 0) {
+		free(profile->cgiStartCmd);
+		free(profile);
+		return NULL;
+	}
+	return profile;
+}
+
+BOOL StartSpawner(LPCGI_PROFILE lpProfile) {
+	HANDLE h = CreateThread(NULL, 0, &RunSpawnerProfile, lpProfile, 0, NULL);
+	if (h == NULL)
+		return FALSE;
+
+	CloseHandle(h);
+	return TRUE;
 }
